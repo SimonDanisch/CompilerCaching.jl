@@ -1360,21 +1360,34 @@ end
 # never mutated).
 function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeInfo)
     resolved = src
+    published = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
     for pc in eachindex(resolved.code)
         stmt = resolved.code[pc]
         rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
         rhs isa Expr && (rhs.head === :invoke || rhs.head === :invoke_modify) || continue
 
-        callee_mi = rhs.args[1]
-        callee_mi isa Core.MethodInstance || continue
-        # Only specializations with a fully-concrete signature can be invoked directly
-        # through a native ABI; anything else (e.g. `@nospecialize`-widened compileable
-        # signatures) keeps its runtime-dispatch fallback semantics.
-        callee_mi.def isa Method && isdispatchtuple(callee_mi.specTypes) &&
-            has_valid_abi_sparams(callee_mi) || continue
-
-        callee_ci = typeinf!(interp, callee_mi)
-        callee_ci === nothing && continue
+        target = rhs.args[1]
+        if target isa Core.CodeInstance
+            # A CodeInstance the cache does not publish for its MethodInstance: a
+            # package image's copy, which loading left out of the cache because this
+            # process had already inferred the method, while the image's callers that
+            # invoke it went in. Two CodeInstances of one MethodInstance in one
+            # compilation is what a back-end keyed on the MethodInstance cannot hold,
+            # so the call goes to the published one, as `typeinf!` does for a root.
+            target.owner === CC.cache_owner(interp) || continue
+            callee_ci = get(published, CC.get_ci_mi(target), nothing)
+            (callee_ci === nothing || callee_ci === target) && continue
+        elseif target isa Core.MethodInstance
+            # Only specializations with a fully-concrete signature can be invoked
+            # directly through a native ABI; anything else (e.g. `@nospecialize`-widened
+            # compileable signatures) keeps its runtime-dispatch fallback semantics.
+            target.def isa Method && isdispatchtuple(target.specTypes) &&
+                has_valid_abi_sparams(target) || continue
+            callee_ci = typeinf!(interp, target)
+            callee_ci === nothing && continue
+        else
+            continue
+        end
         # only rewrite when the callee's source is available, so the returned
         # collection stays closed under direct-call edges
         get_source(callee_ci) === nothing && continue
