@@ -1273,6 +1273,12 @@ direct-call edges, making it suitable for closed-world code generation
   a native ABI (concrete signature, fully-resolved sparams) are resolved; anything
   else (e.g. `@nospecialize`-widened compileable signatures) deliberately keeps its
   runtime-dispatch fallback semantics.
+- `:invoke` targets that are a `CodeInstance` of this cache's owner, but not the one the
+  cache publishes for its `MethodInstance`, are rewritten to the published one when
+  both have the same return type. A package image's callers invoke the image's own
+  copies of external methods, which Julia leaves out of the cache when this process
+  inferred the method first, so without this a collection could hold two
+  `CodeInstance`s of one `MethodInstance`.
 - Referenced `CodeInstance`s that lack stored source (e.g. cached by an earlier
   session) are re-inferred.
 
@@ -1352,28 +1358,53 @@ function has_valid_abi_sparams(mi::Core.MethodInstance)
     return true
 end
 
-# Rewrite `:invoke`/`:invoke_modify` statements whose target is still a bare
-# `MethodInstance` to target a `CodeInstance` instead, inferring one when the cache
-# has none. Codegen can only emit a direct call for a `CodeInstance` operand; a
-# `MethodInstance` operand unconditionally lowers to runtime dispatch. Returns `src`
-# unchanged when there is nothing to rewrite, or a rewritten copy (cached source is
-# never mutated).
+# The `CodeInstance` an `:invoke` operand should target, or `nothing` to leave it.
+#
+# A bare `MethodInstance` resolves to a `CodeInstance`, inferring one when the cache has
+# none: codegen can only emit a direct call for a `CodeInstance` operand, and lowers a
+# `MethodInstance` operand to runtime dispatch. Only specializations with a fully-concrete
+# signature can be invoked directly through a native ABI; anything else (e.g.
+# `@nospecialize`-widened compileable signatures) keeps its runtime-dispatch fallback.
+function resolve_target(interp::CC.AbstractInterpreter, ::CacheView, mi::Core.MethodInstance)
+    mi.def isa Method && isdispatchtuple(mi.specTypes) && has_valid_abi_sparams(mi) ||
+        return nothing
+    return typeinf!(interp, mi)
+end
+
+# A `CodeInstance` of this cache's owner that the cache does not publish for its
+# `MethodInstance` resolves to the published one. A package image carries its own copies
+# of the external methods its precompile workload inferred, and the image's callers invoke
+# those copies. When this process inferred such a method before loading the image, Julia
+# (1.12) does not insert the image's copy into the cache, since one already covers that
+# world range, while code inferred in this process invokes the published one. A collection
+# reaching the method both ways would hold two `CodeInstance`s of one `MethodInstance`,
+# which a back-end keying compiled functions by `MethodInstance` cannot (GPUCompiler
+# asserts). Only a copy with the same return type is replaced: the return type fixes the
+# ABI the caller was compiled against.
+function resolve_target(interp::CC.AbstractInterpreter, published::CacheView,
+                        ci::Core.CodeInstance)
+    ci.owner === CC.cache_owner(interp) || return nothing
+    callee_ci = get(published, CC.get_ci_mi(ci), nothing)
+    (callee_ci === nothing || callee_ci === ci) && return nothing
+    callee_ci.rettype === ci.rettype || return nothing
+    return callee_ci
+end
+
+resolve_target(::CC.AbstractInterpreter, ::CacheView, @nospecialize(target)) = nothing
+
+# Rewrite `:invoke`/`:invoke_modify` statements to target the `CodeInstance` codegen
+# should call, so that a collection holds one `CodeInstance` per `MethodInstance`.
+# Returns `src` unchanged when there is nothing to rewrite, or a rewritten copy (cached
+# source is never mutated). See `resolve_target` for the two cases.
 function resolve_invoke_targets(interp::CC.AbstractInterpreter, src::Core.CodeInfo)
     resolved = src
+    published = CacheView{Nothing}(CC.cache_owner(interp), CC.get_inference_world(interp))
     for pc in eachindex(resolved.code)
         stmt = resolved.code[pc]
         rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
         rhs isa Expr && (rhs.head === :invoke || rhs.head === :invoke_modify) || continue
 
-        callee_mi = rhs.args[1]
-        callee_mi isa Core.MethodInstance || continue
-        # Only specializations with a fully-concrete signature can be invoked directly
-        # through a native ABI; anything else (e.g. `@nospecialize`-widened compileable
-        # signatures) keeps its runtime-dispatch fallback semantics.
-        callee_mi.def isa Method && isdispatchtuple(callee_mi.specTypes) &&
-            has_valid_abi_sparams(callee_mi) || continue
-
-        callee_ci = typeinf!(interp, callee_mi)
+        callee_ci = resolve_target(interp, published, rhs.args[1])
         callee_ci === nothing && continue
         # only rewrite when the callee's source is available, so the returned
         # collection stays closed under direct-call edges

@@ -716,6 +716,81 @@ end
     @test invoke_target(const_src, const_pc) === overlay_mi
 end
 
+@testset "unpublished copies of a cached CodeInstance" begin
+    # A package image carries its own copies of the external methods its precompile
+    # workload inferred, and the image's callers invoke those copies. When this process
+    # inferred such a method before loading the image, Julia 1.12 leaves the image's copy
+    # out of the cache, while code inferred here invokes the published CodeInstance. A
+    # walk reaching the method both ways then held two CodeInstances of one
+    # MethodInstance, which GPUCompiler (keying compiled functions by MethodInstance)
+    # asserts against. Rebuilt here by pointing one call at an unpublished copy.
+    mod = @eval module $(gensym())
+        @noinline child(x::Int) = x + 1
+        kernel(x::Int) = child(x) * child(x + 2)
+    end
+
+    get_ci_mi = Core.Compiler.get_ci_mi
+    function invoke_operand(src::Core.CodeInfo, pc::Int)
+        stmt = src.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        rhs.args[1]
+    end
+    function retarget(src::Core.CodeInfo, pc::Int, target)
+        doctored = copy(src)
+        stmt = doctored.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        new_rhs = Expr(rhs.head, target, rhs.args[2:end]...)
+        doctored.code[pc] = stmt === rhs ? new_rhs : Expr(:(=), stmt.args[1], new_rhs)
+        doctored
+    end
+    # what an image's copy is: a CodeInstance of the same MethodInstance, with source,
+    # that is not in the cache
+    unpublished(ci; owner = ci.owner, rettype = ci.rettype) =
+        Core.CodeInstance(get_ci_mi(ci), owner, rettype, ci.exctype, nothing,
+                          get_source(ci), Int32(0), ci.min_world, ci.max_world,
+                          ci.ipo_purity_bits, nothing, nothing, ci.edges)
+
+    world = Base.get_world_counter()
+    cache = CacheView{TestResults}(:UnpublishedCopyTest, world)
+    interp = TestInterpreter(cache.world, cache, InfCacheT())
+    root = typeinf!(interp, method_instance(mod.kernel, (Int,); world))
+    child_mi = method_instance(mod.child, (Int,); world)
+    published = get(cache, child_mi)
+    src = get_source(root)
+    pcs = findall(eachindex(src.code)) do pc
+        stmt = src.code[pc]
+        rhs = stmt isa Expr && stmt.head === :(=) ? stmt.args[2] : stmt
+        rhs isa Expr && rhs.head === :invoke
+    end
+    @test length(pcs) == 2
+    @test all(pc -> invoke_operand(src, pc) === published, pcs)
+
+    # one call goes to the image's copy: the walk follows the published one only
+    image_copy = unpublished(published)
+    @test get(cache, child_mi) === published
+    doctored = retarget(src, pcs[1], image_copy)
+    @atomic root.inferred = doctored
+    pairs = get_codeinfos(interp, root)
+    @test count(p -> get_ci_mi(p.first) === child_mi, pairs) == 1
+    root_src = only(src for (ci, src) in pairs if ci === root)
+    @test invoke_operand(root_src, pcs[1]) === published
+    @test invoke_operand(root_src, pcs[2]) === published
+    # copy-on-write: the cached source still invokes the copy
+    @test invoke_operand(doctored, pcs[1]) === image_copy
+
+    # a copy with another return type would be called with another ABI: left alone
+    widened = unpublished(published; rettype = Any)
+    @atomic root.inferred = retarget(src, pcs[1], widened)
+    root_src = only(src for (ci, src) in get_codeinfos(interp, root) if ci === root)
+    @test invoke_operand(root_src, pcs[1]) === widened
+
+    # as is a CodeInstance another compiler owns
+    foreign = unpublished(published; owner = :SomeOtherCompiler)
+    @atomic root.inferred = retarget(src, pcs[1], foreign)
+    root_src = only(src for (ci, src) in get_codeinfos(interp, root) if ci === root)
+    @test invoke_operand(root_src, pcs[1]) === foreign
+end
+
 @testset "exact specializations" begin
     # GPU-style consumers request inference of an exact specialization; `typeinf!` must
     # not normalize it to a compileable one first, whose heuristics can widen
